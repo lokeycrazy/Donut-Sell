@@ -21,16 +21,20 @@ public class SellScreen extends Screen {
         int cx = this.width / 2;
         int cy = this.height / 2;
 
-        this.addRenderableWidget(new StringWidget(
-                cx - 120, cy - 54, 240, 12,
-                Component.literal("DonutSell - Auto Auction House Seller"), this.font).alignCenter());
+        this.addRenderableWidget(label("DonutSell - Auto Auction House Seller", cy - 54));
 
         priceBox = new EditBox(this.font, cx - 100, cy - 34, 200, 20, Component.literal("Price"));
         priceBox.setMaxLength(12);
-        priceBox.setFilter(s -> s.matches("\\d*"));
         priceBox.setHint(Component.literal("Price for each stack, e.g. 5000"));
         priceBox.setValue(DonutSellClient.price);
-        priceBox.setResponder(DonutSellClient::setPrice);
+        priceBox.setResponder(text -> {
+            String digits = text.replaceAll("\\D", "");   // numbers only
+            if (!digits.equals(text)) {
+                priceBox.setValue(digits);
+                return;
+            }
+            DonutSellClient.setPrice(digits);
+        });
         this.addRenderableWidget(priceBox);
         this.setInitialFocus(priceBox);
 
@@ -47,5 +51,11 @@ public class SellScreen extends Screen {
 
         this.addRenderableWidget(Button.builder(Component.literal("Close"),
                 b -> DonutSellClient.closeScreen()).bounds(cx - 100, cy + 18, 200, 20).build());
+    }
+
+    private StringWidget label(String text, int y) {
+        Component c = Component.literal(text);
+        int w = this.font.width(c);
+        return new StringWidget(this.width / 2 - w / 2, y, w, 12, c, this.font);
     }
 }

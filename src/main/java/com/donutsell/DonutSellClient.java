@@ -21,6 +21,7 @@ import org.lwjgl.glfw.GLFW;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -97,17 +98,42 @@ public class DonutSellClient implements ClientModInitializer {
         return 0L;
     }
 
-    private static boolean isDown(Minecraft mc, KeyMapping mapping) {
+    /** Finds the key currently bound to a KeyMapping (works even if the accessor is renamed). */
+    private static InputConstants.Key keyOf(KeyMapping mapping) {
+        try {
+            for (Field f : KeyMapping.class.getDeclaredFields()) {
+                if (f.getName().equals("key") && f.getType() == InputConstants.Key.class) {
+                    f.setAccessible(true);
+                    return (InputConstants.Key) f.get(mapping);
+                }
+            }
+            for (Method m : KeyMapping.class.getMethods()) {
+                if (m.getParameterCount() == 0 && m.getReturnType() == InputConstants.Key.class
+                        && !m.getName().toLowerCase().contains("default")) {
+                    return (InputConstants.Key) m.invoke(mapping);
+                }
+            }
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+        }
+        return null;
+    }
+
+    private static boolean isDown(Minecraft mc, KeyMapping mapping, int defaultCode) {
         long handle = windowHandle(mc);
         if (handle == 0L) return false;
-        InputConstants.Key key = mapping.getKey();
-        if (key.getType() != InputConstants.Type.KEYSYM || key.getValue() <= 0) return false;
-        return GLFW.glfwGetKey(handle, key.getValue()) == GLFW.GLFW_PRESS;
+        int code = defaultCode;
+        InputConstants.Key key = keyOf(mapping);
+        if (key != null) {
+            if (key.getType() != InputConstants.Type.KEYSYM) return false;
+            code = key.getValue();
+        }
+        if (code <= 0) return false;
+        return GLFW.glfwGetKey(handle, code) == GLFW.GLFW_PRESS;
     }
 
     private static void handleKeys(Minecraft mc) {
-        boolean open = isDown(mc, openGuiKey);
-        boolean toggle = isDown(mc, toggleKey);
+        boolean open = isDown(mc, openGuiKey, InputConstants.KEY_K);
+        boolean toggle = isDown(mc, toggleKey, InputConstants.KEY_J);
 
         boolean inSellGui = current instanceof SellScreen;
         boolean allowed = !(current instanceof ChatScreen)

@@ -17,16 +17,17 @@ public class ListingFailedScreen extends Screen {
         int cx = this.width / 2;
         int cy = this.height / 2;
 
-        this.addRenderableWidget(new StringWidget(0, cy - 40, this.width, 12,
-                Component.literal("DonutSell STOPPED"), this.font).alignCenter());
-        this.addRenderableWidget(new StringWidget(0, cy - 24, this.width, 12,
-                Component.literal("Your auction house listings look full (/ah sell did not list the item)."),
-                this.font).alignCenter());
-        this.addRenderableWidget(new StringWidget(0, cy - 12, this.width, 12,
-                Component.literal("Clear some listings, then press your start/stop key to continue."),
-                this.font).alignCenter());
+        this.addRenderableWidget(label("DonutSell STOPPED", cy - 40));
+        this.addRenderableWidget(label("Your auction house listings look full (/ah sell did not list the item).", cy - 24));
+        this.addRenderableWidget(label("Clear some listings, then press your start/stop key to continue.", cy - 12));
 
         this.addRenderableWidget(Button.builder(Component.literal("OK"),
                 b -> DonutSellClient.closeScreen()).bounds(cx - 50, cy + 10, 100, 20).build());
+    }
+
+    private StringWidget label(String text, int y) {
+        Component c = Component.literal(text);
+        int w = this.font.width(c);
+        return new StringWidget(this.width / 2 - w / 2, y, w, 12, c, this.font);
     }
 }
