@@ -5,6 +5,7 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
 import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
+import net.fabricmc.fabric.api.client.screen.v1.ScreenKeyboardEvents;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
@@ -54,6 +55,9 @@ public class DonutSellClient implements ClientModInitializer {
     private static int hotbarIndex = 0;
     private static int attempts = 0;
     private static long cachedHandle = 0L;
+    private static long lastOpenAt = 0L;
+    private static long lastToggleAt = 0L;
+    private static boolean announced = false;
 
     @Override
     public void onInitializeClient() {
@@ -66,7 +70,16 @@ public class DonutSellClient implements ClientModInitializer {
         toggleKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
                 "key.donutsell.toggle", InputConstants.Type.KEYSYM, InputConstants.KEY_J, category));
 
-        // Remember which screen is open so keys can be ignored while typing in chat.
+        // Keys pressed while a screen (chest, inventory, ...) is open.
+        ScreenEvents.BEFORE_INIT.register((client, screen, w, h) -> {
+            if (screen instanceof ChatScreen) return; // never react while typing in chat
+            ScreenKeyboardEvents.beforeKeyPress(screen).register((s, keyEvent) -> {
+                if (openGuiKey.matches(keyEvent)) triggerOpen(client, "screen event");
+                if (toggleKey.matches(keyEvent)) triggerToggle(client, "screen event");
+            });
+        });
+
+        // Remember which screen is open so the fallback key check can ignore chat.
         ScreenEvents.AFTER_INIT.register((client, screen, w, h) -> {
             current = screen;
             ScreenEvents.remove(screen).register(s -> {
@@ -132,22 +145,39 @@ public class DonutSellClient implements ClientModInitializer {
     }
 
     private static void handleKeys(Minecraft mc) {
+        // 1) Normal in-world key presses (the standard Fabric way).
+        while (openGuiKey.consumeClick()) triggerOpen(mc, "world key");
+        while (toggleKey.consumeClick()) triggerToggle(mc, "world key");
+
+        // 2) Direct keyboard check as a backup (covers chests/inventory). Duplicates are filtered out.
         boolean open = isDown(mc, openGuiKey, InputConstants.KEY_K);
         boolean toggle = isDown(mc, toggleKey, InputConstants.KEY_J);
-
-        boolean inSellGui = current instanceof SellScreen;
-        boolean allowed = !(current instanceof ChatScreen)
-                && (current == null || current instanceof AbstractContainerScreen<?> || inSellGui);
-
-        if (allowed && open && !wasOpenDown && !inSellGui) {
-            setScreen(mc, new SellScreen());
-        }
-        if (allowed && toggle && !wasToggleDown) {
-            if (isRunning()) stop(mc, true);
-            else start(mc);
-        }
+        boolean allowed = current == null
+                || current instanceof AbstractContainerScreen<?>
+                || current instanceof SellScreen;
+        if (allowed && open && !wasOpenDown) triggerOpen(mc, "key poll");
+        if (allowed && toggle && !wasToggleDown) triggerToggle(mc, "key poll");
         wasOpenDown = open;
         wasToggleDown = toggle;
+    }
+
+    private static void triggerOpen(Minecraft mc, String source) {
+        long now = System.currentTimeMillis();
+        if (now - lastOpenAt < 600L) return; // same key press seen by two detectors
+        lastOpenAt = now;
+        if (mc.player == null || current instanceof SellScreen) return;
+        System.out.println("[DonutSell] open-GUI key (" + source + ")");
+        setScreen(mc, new SellScreen());
+    }
+
+    private static void triggerToggle(Minecraft mc, String source) {
+        long now = System.currentTimeMillis();
+        if (now - lastToggleAt < 600L) return;
+        lastToggleAt = now;
+        if (mc.player == null) return;
+        System.out.println("[DonutSell] start/stop key (" + source + ")");
+        if (isRunning()) stop(mc, true);
+        else start(mc);
     }
 
     // ===================================================================================
@@ -212,6 +242,11 @@ public class DonutSellClient implements ClientModInitializer {
         if (player == null || mc.gameMode == null) {
             state = State.IDLE; // left the world
             return;
+        }
+
+        if (!announced) {
+            announced = true;
+            player.sendOverlayMessage(Component.literal("DonutSell loaded"));
         }
 
         handleKeys(mc);
@@ -317,20 +352,35 @@ public class DonutSellClient implements ClientModInitializer {
         Object gui = null;
         try {
             gui = Minecraft.class.getField("gui").get(mc);
-        } catch (ReflectiveOperationException ignored) {
+        } catch (ReflectiveOperationException e1) {
+            try {
+                Field f = Minecraft.class.getDeclaredField("gui");
+                f.setAccessible(true);
+                gui = f.get(mc);
+            } catch (ReflectiveOperationException ignored) {
+            }
         }
         if (gui != null && invokeSetScreen(gui, screen)) return;
-        invokeSetScreen(mc, screen);
+        if (invokeSetScreen(mc, screen)) return;
+        System.out.println("[DonutSell] ERROR: could not find a setScreen method");
+        if (screen != null && mc.player != null) {
+            mc.player.sendOverlayMessage(Component.literal("DonutSell: could not open screen (see log)"));
+        }
     }
 
     private static boolean invokeSetScreen(Object target, Screen screen) {
-        for (Method m : target.getClass().getMethods()) {
-            if (m.getName().equals("setScreen") && m.getParameterCount() == 1
-                    && m.getParameterTypes()[0].isAssignableFrom(Screen.class)) {
-                try {
-                    m.invoke(target, screen);
-                    return true;
-                } catch (ReflectiveOperationException ignored) {
+        Method[][] groups = { target.getClass().getMethods(), target.getClass().getDeclaredMethods() };
+        for (Method[] group : groups) {
+            for (Method m : group) {
+                if (m.getName().equals("setScreen") && m.getParameterCount() == 1
+                        && m.getParameterTypes()[0].isAssignableFrom(Screen.class)) {
+                    try {
+                        m.setAccessible(true);
+                        m.invoke(target, screen);
+                        return true;
+                    } catch (ReflectiveOperationException | RuntimeException e) {
+                        System.out.println("[DonutSell] setScreen failed: " + e + " / " + e.getCause());
+                    }
                 }
             }
         }
