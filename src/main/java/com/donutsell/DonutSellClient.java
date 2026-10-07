@@ -40,14 +40,33 @@ public class DonutSellClient implements ClientModInitializer {
     private static final long REFILL_STEP_MS = 150L;     // time between inventory moves (so you can watch)
     // -------------------------------------------------------------------------------------
 
-    private enum State { IDLE, SELECT, SEND, CHECK, REFILL_OPEN, REFILL_MOVE, REFILL_CLOSE }
+    // ---- Order flipping (slot numbers are 0-indexed) -----------------------------------
+    // /orders -> chest icon (slot 51) -> first order (slot 0) -> center chest (slot 13) -> Collect Items
+    private static final int[] NAV_SLOTS = {51, 0, 13};
+    private static final int COLLECT_ITEM_SLOTS = 45;      // slots 0-44 hold the items
+    private static final int COLLECT_NEXT_SLOT = 53;       // next-page arrow
+    private static final int EMPTY_PAGES_LIMIT = 3;        // pages in a row with no items => order empty
+    private static final long COLLECT_DELAY_MS = 300L;     // time between shift-clicks
+    private static final long MENU_SETTLE_MS = 600L;       // let a newly opened menu fill with items
+    private static final long PAGE_SETTLE_MS = 800L;       // let a new page load
+    private static final long MENU_TIMEOUT_MS = 5000L;     // give up if a menu never opens
+    private static final long FIRST_CHEST_EXTRA_DELAY_MS = 1000L; // extra wait once "my orders" opens (laggy step)
+    private static final long FIRST_CHEST_TIMEOUT_MS = 10000L;    // that step is allowed to take longer
+    // -------------------------------------------------------------------------------------
+
+    private enum State {
+        IDLE, SELECT, SEND, CHECK, REFILL_OPEN, REFILL_MOVE, REFILL_CLOSE,
+        FLIP_COMMAND, FLIP_WAIT_MENU, FLIP_CLICK_NAV, FLIP_COLLECT, FLIP_CLOSE
+    }
 
     public static String price = "";
 
     private static KeyMapping openGuiKey;
     private static KeyMapping toggleKey;
+    private static KeyMapping flipKey;
     private static boolean wasOpenDown = false;
     private static boolean wasToggleDown = false;
+    private static boolean wasFlipDown = false;
     private static Screen current = null;
 
     private static State state = State.IDLE;
@@ -58,6 +77,18 @@ public class DonutSellClient implements ClientModInitializer {
     private static long lastOpenAt = 0L;
     private static long lastToggleAt = 0L;
     private static boolean announced = false;
+    private static long lastFlipAt = 0L;
+
+    // order-flip working state
+    private static boolean flipMode = false;
+    private static int navIndex = 0;
+    private static int prevContainerId = 0;
+    private static Screen prevScreen = null;
+    private static long deadline = 0L;
+    private static boolean pageClicked = false;
+    private static int emptyStreak = 0;
+    private static int lastClickedSlot = -1;
+    private static int sameSlotClicks = 0;
 
     @Override
     public void onInitializeClient() {
@@ -69,6 +100,8 @@ public class DonutSellClient implements ClientModInitializer {
                 "key.donutsell.open_gui", InputConstants.Type.KEYSYM, InputConstants.KEY_K, category));
         toggleKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
                 "key.donutsell.toggle", InputConstants.Type.KEYSYM, InputConstants.KEY_J, category));
+        flipKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+                "key.donutsell.flip", InputConstants.Type.KEYSYM, InputConstants.KEY_L, category));
 
         // Keys pressed while a screen (chest, inventory, ...) is open.
         ScreenEvents.BEFORE_INIT.register((client, screen, w, h) -> {
@@ -76,6 +109,7 @@ public class DonutSellClient implements ClientModInitializer {
             ScreenKeyboardEvents.beforeKeyPress(screen).register((s, keyEvent) -> {
                 if (openGuiKey.matches(keyEvent)) triggerOpen(client, "screen event");
                 if (toggleKey.matches(keyEvent)) triggerToggle(client, "screen event");
+                if (flipKey.matches(keyEvent)) triggerFlip(client, "screen event");
             });
         });
 
@@ -148,17 +182,21 @@ public class DonutSellClient implements ClientModInitializer {
         // 1) Normal in-world key presses (the standard Fabric way).
         while (openGuiKey.consumeClick()) triggerOpen(mc, "world key");
         while (toggleKey.consumeClick()) triggerToggle(mc, "world key");
+        while (flipKey.consumeClick()) triggerFlip(mc, "world key");
 
         // 2) Direct keyboard check as a backup (covers chests/inventory). Duplicates are filtered out.
         boolean open = isDown(mc, openGuiKey, InputConstants.KEY_K);
         boolean toggle = isDown(mc, toggleKey, InputConstants.KEY_J);
+        boolean flip = isDown(mc, flipKey, InputConstants.KEY_L);
         boolean allowed = current == null
                 || current instanceof AbstractContainerScreen<?>
                 || current instanceof SellScreen;
         if (allowed && open && !wasOpenDown) triggerOpen(mc, "key poll");
         if (allowed && toggle && !wasToggleDown) triggerToggle(mc, "key poll");
+        if (allowed && flip && !wasFlipDown) triggerFlip(mc, "key poll");
         wasOpenDown = open;
         wasToggleDown = toggle;
+        wasFlipDown = flip;
     }
 
     private static void triggerOpen(Minecraft mc, String source) {
@@ -180,6 +218,16 @@ public class DonutSellClient implements ClientModInitializer {
         else start(mc);
     }
 
+    private static void triggerFlip(Minecraft mc, String source) {
+        long now = System.currentTimeMillis();
+        if (now - lastFlipAt < 600L) return;
+        lastFlipAt = now;
+        if (mc.player == null) return;
+        System.out.println("[DonutSell] order-flip key (" + source + ")");
+        if (isRunning()) stop(mc, true);
+        else startFlip(mc);
+    }
+
     // ===================================================================================
     //  Start / stop
     // ===================================================================================
@@ -189,6 +237,14 @@ public class DonutSellClient implements ClientModInitializer {
     }
 
     public static boolean start(Minecraft mc) {
+        return begin(mc, false);
+    }
+
+    public static boolean startFlip(Minecraft mc) {
+        return begin(mc, true);
+    }
+
+    private static boolean begin(Minecraft mc, boolean flip) {
         LocalPlayer player = mc.player;
         if (player == null) return false;
         if (!isValidPrice(price)) {
@@ -198,15 +254,22 @@ public class DonutSellClient implements ClientModInitializer {
         }
         hotbarIndex = 0;
         attempts = 0;
-        state = State.SELECT;
+        flipMode = flip;
         nextAt = System.currentTimeMillis();
-        player.sendOverlayMessage(Component.literal("DonutSell: ON (" + price + " per stack)"));
+        if (flip) {
+            state = State.FLIP_COMMAND;
+            player.sendOverlayMessage(Component.literal("DonutSell: order flip ON (" + price + " per stack)"));
+        } else {
+            state = State.SELECT;
+            player.sendOverlayMessage(Component.literal("DonutSell: ON (" + price + " per stack)"));
+        }
         return true;
     }
 
     public static void stop(Minecraft mc, boolean announce) {
         boolean wasRunning = isRunning();
         state = State.IDLE;
+        flipMode = false;
         if (wasRunning && announce && mc.player != null) {
             mc.player.sendOverlayMessage(Component.literal("DonutSell: OFF"));
         }
@@ -214,6 +277,7 @@ public class DonutSellClient implements ClientModInitializer {
 
     private static void finish(Minecraft mc) {
         state = State.IDLE;
+        flipMode = false;
         if (mc.player != null) {
             mc.player.sendOverlayMessage(Component.literal("DonutSell: finished, nothing left to sell"));
         }
@@ -221,7 +285,17 @@ public class DonutSellClient implements ClientModInitializer {
 
     private static void failed(Minecraft mc) {
         state = State.IDLE;
+        flipMode = false;
         setScreen(mc, new ListingFailedScreen());
+    }
+
+    private static void flipStop(Minecraft mc, String line1, String line2) {
+        state = State.IDLE;
+        flipMode = false;
+        if (mc.player != null && mc.player.containerMenu != mc.player.inventoryMenu) {
+            mc.player.closeContainer();
+        }
+        setScreen(mc, new ListingFailedScreen(line1, line2));
     }
 
     private static boolean isValidPrice(String p) {
@@ -267,6 +341,9 @@ public class DonutSellClient implements ClientModInitializer {
                 } else if (firstMainWithItem(player) >= 0) {
                     state = State.REFILL_OPEN;
                     nextAt = now;
+                } else if (flipMode) {
+                    state = State.FLIP_COMMAND;   // everything sold: go get more from the order
+                    nextAt = now + INV_OPEN_WAIT_MS;
                 } else {
                     finish(mc);
                 }
@@ -313,8 +390,119 @@ public class DonutSellClient implements ClientModInitializer {
                 state = State.SELECT;
                 nextAt = now + INV_OPEN_WAIT_MS;
             }
+            case FLIP_COMMAND -> {
+                prevContainerId = player.containerMenu.containerId;
+                prevScreen = current;
+                navIndex = 0;
+                player.connection.sendCommand("orders");
+                state = State.FLIP_WAIT_MENU;
+                deadline = now + MENU_TIMEOUT_MS;
+            }
+            case FLIP_WAIT_MENU -> {
+                if (menuOpenedSince(player)) {
+                    if (navIndex >= NAV_SLOTS.length) {
+                        String title = screenTitle();
+                        if (!title.isEmpty() && !title.contains("Collect")) {
+                            flipStop(mc, "Expected the Collect Items menu but got:", title);
+                            return;
+                        }
+                        pageClicked = false;
+                        emptyStreak = 0;
+                        lastClickedSlot = -1;
+                        sameSlotClicks = 0;
+                        state = State.FLIP_COLLECT;
+                    } else {
+                        state = State.FLIP_CLICK_NAV;
+                    }
+                    nextAt = now + MENU_SETTLE_MS;
+                    if (navIndex == 1) nextAt += FIRST_CHEST_EXTRA_DELAY_MS; // "my orders" page just opened
+                } else if (now > deadline) {
+                    flipStop(mc, "A menu did not open (step " + navIndex + " of " + NAV_SLOTS.length + ").",
+                            "Open title: " + screenTitle());
+                }
+            }
+            case FLIP_CLICK_NAV -> {
+                prevContainerId = player.containerMenu.containerId;
+                prevScreen = current;
+                mc.gameMode.handleContainerInput(player.containerMenu.containerId,
+                        NAV_SLOTS[navIndex], 0, ContainerInput.PICKUP, player);
+                navIndex++;
+                state = State.FLIP_WAIT_MENU;
+                deadline = now + (navIndex == 1 ? FIRST_CHEST_TIMEOUT_MS : MENU_TIMEOUT_MS);
+            }
+            case FLIP_COLLECT -> {
+                var menu = player.containerMenu;
+                if (menu == player.inventoryMenu || menu.slots.size() < 54) {
+                    flipStop(mc, "The Collect Items menu closed unexpectedly.", "Order flip stopped.");
+                    return;
+                }
+                if (firstEmptyInventorySlot(player) < 0) {
+                    state = State.FLIP_CLOSE;           // inventory full: go sell
+                    nextAt = now + 300L;
+                    return;
+                }
+                int slot = firstMenuItem(menu);
+                if (slot >= 0) {
+                    if (slot == lastClickedSlot) sameSlotClicks++;
+                    else { lastClickedSlot = slot; sameSlotClicks = 1; }
+                    if (sameSlotClicks > 3) {           // item won't move: treat inventory as full
+                        state = State.FLIP_CLOSE;
+                        nextAt = now + 300L;
+                        return;
+                    }
+                    mc.gameMode.handleContainerInput(menu.containerId, slot, 0, ContainerInput.QUICK_MOVE, player);
+                    pageClicked = true;
+                    nextAt = now + COLLECT_DELAY_MS;
+                } else {
+                    if (pageClicked) emptyStreak = 0; else emptyStreak++;
+                    if (emptyStreak >= EMPTY_PAGES_LIMIT) {
+                        flipStop(mc, "This order looks empty (" + EMPTY_PAGES_LIMIT + " pages in a row had no items).",
+                                "Anything already collected is still in your inventory - press J to sell it.");
+                        return;
+                    }
+                    mc.gameMode.handleContainerInput(menu.containerId, COLLECT_NEXT_SLOT, 0,
+                            ContainerInput.PICKUP, player);
+                    pageClicked = false;
+                    lastClickedSlot = -1;
+                    sameSlotClicks = 0;
+                    nextAt = now + PAGE_SETTLE_MS;
+                }
+            }
+            case FLIP_CLOSE -> {
+                player.closeContainer();
+                hotbarIndex = 0;
+                state = State.SELECT;                    // hand over to the selling loop
+                nextAt = now + MENU_SETTLE_MS;
+            }
             default -> { }
         }
+    }
+
+    // ---- order-flip helpers --------------------------------------------------------------
+
+    private static boolean menuOpenedSince(LocalPlayer p) {
+        if (p.containerMenu == p.inventoryMenu) return false;
+        if (p.containerMenu.containerId != prevContainerId) return true;
+        return current != prevScreen && current instanceof AbstractContainerScreen<?>;
+    }
+
+    private static String screenTitle() {
+        if (current instanceof AbstractContainerScreen<?> cs) {
+            return cs.getTitle().getString();
+        }
+        return "";
+    }
+
+    private static int firstEmptyInventorySlot(LocalPlayer p) {
+        for (int i = 0; i < 36; i++) if (!hasItem(p, i)) return i;
+        return -1;
+    }
+
+    private static int firstMenuItem(net.minecraft.world.inventory.AbstractContainerMenu menu) {
+        for (int i = 0; i < COLLECT_ITEM_SLOTS; i++) {
+            if (!menu.getSlot(i).getItem().isEmpty()) return i;
+        }
+        return -1;
     }
 
     // ===================================================================================

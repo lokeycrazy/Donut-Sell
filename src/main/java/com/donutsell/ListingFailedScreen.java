@@ -8,8 +8,18 @@ import net.minecraft.network.chat.Component;
 /** Popup that stays on screen until you click OK (or press Esc). */
 public class ListingFailedScreen extends Screen {
 
+    private final String line1;
+    private final String line2;
+
     public ListingFailedScreen() {
+        this("Your auction house listings look full (/ah sell did not list the item).",
+                "Clear some listings, then press your start/stop key to continue.");
+    }
+
+    public ListingFailedScreen(String line1, String line2) {
         super(Component.literal("DonutSell stopped"));
+        this.line1 = line1;
+        this.line2 = line2;
     }
 
     @Override
@@ -18,8 +28,8 @@ public class ListingFailedScreen extends Screen {
         int cy = this.height / 2;
 
         this.addRenderableWidget(label("DonutSell STOPPED", cy - 40));
-        this.addRenderableWidget(label("Your auction house listings look full (/ah sell did not list the item).", cy - 24));
-        this.addRenderableWidget(label("Clear some listings, then press your start/stop key to continue.", cy - 12));
+        this.addRenderableWidget(label(line1, cy - 24));
+        this.addRenderableWidget(label(line2, cy - 12));
 
         this.addRenderableWidget(Button.builder(Component.literal("OK"),
                 b -> DonutSellClient.closeScreen()).bounds(cx - 50, cy + 10, 100, 20).build());

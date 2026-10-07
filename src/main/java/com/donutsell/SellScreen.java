@@ -38,8 +38,9 @@ public class SellScreen extends Screen {
         this.addRenderableWidget(priceBox);
         this.setInitialFocus(priceBox);
 
-        String label = DonutSellClient.isRunning() ? "Stop selling" : "Begin selling";
-        this.addRenderableWidget(Button.builder(Component.literal(label), b -> {
+        boolean running = DonutSellClient.isRunning();
+
+        this.addRenderableWidget(Button.builder(Component.literal(running ? "Stop" : "Begin selling"), b -> {
             Minecraft mc = Minecraft.getInstance();
             if (DonutSellClient.isRunning()) {
                 DonutSellClient.stop(mc, true);
@@ -49,8 +50,18 @@ public class SellScreen extends Screen {
             }
         }).bounds(cx - 100, cy - 6, 200, 20).build());
 
+        this.addRenderableWidget(Button.builder(Component.literal(running ? "Stop" : "Begin order flipping"), b -> {
+            Minecraft mc = Minecraft.getInstance();
+            if (DonutSellClient.isRunning()) {
+                DonutSellClient.stop(mc, true);
+                DonutSellClient.closeScreen();
+            } else if (DonutSellClient.startFlip(mc)) {
+                DonutSellClient.closeScreen();
+            }
+        }).bounds(cx - 100, cy + 18, 200, 20).build());
+
         this.addRenderableWidget(Button.builder(Component.literal("Close"),
-                b -> DonutSellClient.closeScreen()).bounds(cx - 100, cy + 18, 200, 20).build());
+                b -> DonutSellClient.closeScreen()).bounds(cx - 100, cy + 42, 200, 20).build());
     }
 
     private StringWidget label(String text, int y) {
