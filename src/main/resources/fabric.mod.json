@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "donutsell",
+  "version": "${version}",
+  "name": "DonutSell",
+  "description": "Auto auction house seller: pick a price in a GUI, then it runs /ah sell for every item in your hotbar and refills the hotbar from your inventory.",
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.donutsell.DonutSellClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": "26.2",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}
