@@ -7,10 +7,12 @@ import net.minecraft.client.gui.components.StringWidget;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
 
-/** The settings GUI: one price box, a Begin/Stop button and a Close button. */
+/** The settings GUI. */
 public class SellScreen extends Screen {
 
-    private EditBox priceBox;
+    private EditBox stackBox;
+    private EditBox singleBox;
+    private EditBox delayBox;
 
     public SellScreen() {
         super(Component.literal("DonutSell"));
@@ -21,22 +23,28 @@ public class SellScreen extends Screen {
         int cx = this.width / 2;
         int cy = this.height / 2;
 
-        this.addRenderableWidget(label("DonutSell - Auto Auction House Seller", cy - 54));
+        this.addRenderableWidget(label("DonutSell v1.2.1 - Auto Auction House Seller", cy - 84));
 
-        priceBox = new EditBox(this.font, cx - 100, cy - 34, 200, 20, Component.literal("Price"));
-        priceBox.setMaxLength(12);
-        priceBox.setHint(Component.literal("Price for each stack, e.g. 5000"));
-        priceBox.setValue(DonutSellClient.price);
-        priceBox.setResponder(text -> {
-            String digits = text.replaceAll("\\D", "");   // numbers only
-            if (!digits.equals(text)) {
-                priceBox.setValue(digits);
-                return;
-            }
-            DonutSellClient.setPrice(digits);
-        });
-        this.addRenderableWidget(priceBox);
-        this.setInitialFocus(priceBox);
+        stackBox = digitsBox(cx - 100, cy - 66, "Stack price (whole stack), e.g. 5000",
+                DonutSellClient.price, DonutSellClient::setPrice, 12);
+        this.addRenderableWidget(stackBox);
+        this.setInitialFocus(stackBox);
+
+        singleBox = digitsBox(cx - 100, cy - 18, "Single price (one item), e.g. 400",
+                DonutSellClient.singlePrice, DonutSellClient::setSinglePrice, 12);
+        singleBox.setEditable(DonutSellClient.singlesMode);
+        this.addRenderableWidget(singleBox);
+
+        this.addRenderableWidget(Button.builder(modeLabel(), b -> {
+            DonutSellClient.setSinglesMode(!DonutSellClient.singlesMode);
+            b.setMessage(modeLabel());
+            singleBox.setEditable(DonutSellClient.singlesMode);
+        }).bounds(cx - 100, cy - 42, 200, 20).build());
+
+        delayBox = digitsBox(cx - 100, cy + 6,
+                "Listing delay in ms (min " + DonutSellClient.MIN_LIST_DELAY_MS + ")",
+                DonutSellClient.delayText, DonutSellClient::setDelay, 5);
+        this.addRenderableWidget(delayBox);
 
         boolean running = DonutSellClient.isRunning();
 
@@ -48,7 +56,7 @@ public class SellScreen extends Screen {
             } else if (DonutSellClient.start(mc)) {
                 DonutSellClient.closeScreen();
             }
-        }).bounds(cx - 100, cy - 6, 200, 20).build());
+        }).bounds(cx - 100, cy + 30, 200, 20).build());
 
         this.addRenderableWidget(Button.builder(Component.literal(running ? "Stop" : "Begin order flipping"), b -> {
             Minecraft mc = Minecraft.getInstance();
@@ -58,10 +66,31 @@ public class SellScreen extends Screen {
             } else if (DonutSellClient.startFlip(mc)) {
                 DonutSellClient.closeScreen();
             }
-        }).bounds(cx - 100, cy + 18, 200, 20).build());
+        }).bounds(cx - 100, cy + 54, 200, 20).build());
 
         this.addRenderableWidget(Button.builder(Component.literal("Close"),
-                b -> DonutSellClient.closeScreen()).bounds(cx - 100, cy + 42, 200, 20).build());
+                b -> DonutSellClient.closeScreen()).bounds(cx - 100, cy + 78, 200, 20).build());
+    }
+
+    private Component modeLabel() {
+        return Component.literal("Mode: " + (DonutSellClient.singlesMode ? "Singles" : "Stacks"));
+    }
+
+    private EditBox digitsBox(int x, int y, String hint, String value,
+                              java.util.function.Consumer<String> onChange, int maxLen) {
+        EditBox box = new EditBox(this.font, x, y, 200, 20, Component.literal(hint));
+        box.setMaxLength(maxLen);
+        box.setHint(Component.literal(hint));
+        box.setValue(value == null ? "" : value);
+        box.setResponder(text -> {
+            String digits = text.replaceAll("\\D", "");   // numbers only
+            if (!digits.equals(text)) {
+                box.setValue(digits);
+                return;
+            }
+            onChange.accept(digits);
+        });
+        return box;
     }
 
     private StringWidget label(String text, int y) {
