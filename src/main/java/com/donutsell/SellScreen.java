@@ -23,7 +23,7 @@ public class SellScreen extends Screen {
         int cx = this.width / 2;
         int cy = this.height / 2;
 
-        this.addRenderableWidget(label("DonutSell v1.2.1 - Auto Auction House Seller", cy - 84));
+        this.addRenderableWidget(label("DonutSell v1.2.2 - Auto Auction House Seller", cy - 84));
 
         stackBox = digitsBox(cx - 100, cy - 66, "Stack price (whole stack), e.g. 5000",
                 DonutSellClient.price, DonutSellClient::setPrice, 12);

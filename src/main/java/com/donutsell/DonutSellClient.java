@@ -103,6 +103,7 @@ public class DonutSellClient implements ClientModInitializer {
     private static int collectCursor = 0;
     private static int collectSweeps = 0;
     private static int splitSource = -1;
+    private static final java.util.BitSet splitUsed = new java.util.BitSet(); // slots already given a single this cycle
 
     @Override
     public void onInitializeClient() {
@@ -271,6 +272,7 @@ public class DonutSellClient implements ClientModInitializer {
         nextFrom = 0;
         pendingSlot = -1;
         pendingChecks = 0;
+        splitUsed.clear();
         flipMode = flip;
         nextAt = System.currentTimeMillis();
         String what = singlesMode ? (singlePrice + " per single") : (price + " per stack");
@@ -473,6 +475,7 @@ public class DonutSellClient implements ClientModInitializer {
                         collectCursor = 0;
                         collectSweeps = 0;
                         splitSource = -1;
+                        splitUsed.clear();
                         state = State.FLIP_COLLECT;
                     } else {
                         state = State.FLIP_CLICK_NAV;
@@ -538,8 +541,9 @@ public class DonutSellClient implements ClientModInitializer {
     private static void collectSingles(Minecraft mc, LocalPlayer player, AbstractContainerMenu menu, long now) {
         var held = menu.getCarried();
         if (!held.isEmpty()) {
-            int target = firstEmptyMenuInventorySlot(menu);
+            int target = nextSplitTarget(menu);
             if (target >= 0) {
+                splitUsed.set(target);   // never give the same slot a second item, even if the server is slow to confirm
                 mc.gameMode.handleContainerInput(menu.containerId, target, 1, ContainerInput.PICKUP, player);
                 nextAt = now + SPLIT_DELAY_MS;
             } else {
@@ -552,7 +556,7 @@ public class DonutSellClient implements ClientModInitializer {
             }
             return;
         }
-        if (firstEmptyInventorySlot(player) < 0) {
+        if (nextSplitTarget(menu) < 0) {
             state = State.FLIP_CLOSE;
             nextAt = now + 200L;
             return;
@@ -646,10 +650,10 @@ public class DonutSellClient implements ClientModInitializer {
         return -1;
     }
 
-    /** Empty slot in the player-inventory part of an open chest menu (the last 36 slots). */
-    private static int firstEmptyMenuInventorySlot(AbstractContainerMenu menu) {
+    /** Next empty, not-yet-used slot in the player-inventory part of an open chest menu (the last 36 slots). */
+    private static int nextSplitTarget(AbstractContainerMenu menu) {
         for (int i = menu.slots.size() - 36; i < menu.slots.size(); i++) {
-            if (menu.getSlot(i).getItem().isEmpty()) return i;
+            if (!splitUsed.get(i) && menu.getSlot(i).getItem().isEmpty()) return i;
         }
         return -1;
     }
