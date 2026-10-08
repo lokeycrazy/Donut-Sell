@@ -3,7 +3,8 @@
   "id": "donutsell",
   "version": "${version}",
   "name": "DonutSell",
-  "description": "Auto auction house seller: pick a price in a GUI, then it runs /ah sell for every item in your hotbar and refills the hotbar from your inventory.",
+  "description": "DonutSell by Exhale: auto auction house seller and order flipper with failsafes.",
+  "authors": ["Exhale"],
   "license": "MIT",
   "environment": "client",
   "entrypoints": {

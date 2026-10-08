@@ -7,6 +7,7 @@ import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
 import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
 import net.fabricmc.fabric.api.client.screen.v1.ScreenKeyboardEvents;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.ChatFormatting;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.ChatScreen;
@@ -27,47 +28,55 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.BitSet;
 import java.util.Properties;
 
 public class DonutSellClient implements ClientModInitializer {
 
     public static final String MOD_ID = "donutsell";
+    public static final String VERSION = "2.0.1";
 
-    // ---- Selling timing ----------------------------------------------------------------
-    public static final int MIN_LIST_DELAY_MS = 250;      // server limit between commands
-    private static final long SELECT_WAIT_MS = 100L;      // only when a slot must change right before a command
-    private static final long PRESELECT_AFTER_MS = 100L;  // switch to the next hotbar slot this long after a command
-    private static final long INV_OPEN_WAIT_MS = 200L;    // pause after the inventory opens / before it closes
-    private static final long REFILL_STEP_MS = 50L;       // time between inventory moves (you can still watch)
-    private static final long REFILL_AFTER_MS = 150L;     // pause after closing the inventory
-    // ---- Order flipping (slot numbers are 0-indexed) -----------------------------------
-    // /orders -> chest icon (slot 51) -> first order (slot 0) -> center chest (slot 13) -> Collect Items
-    private static final int[] NAV_SLOTS = {51, 0, 13};
-    private static final int COLLECT_ITEM_SLOTS = 45;      // slots 0-44 hold the items
-    private static final int COLLECT_NEXT_SLOT = 53;       // next-page arrow
-    private static final int EMPTY_PAGES_LIMIT = 3;        // pages in a row with no items => order empty
-    private static final long COLLECT_DELAY_MS = 100L;     // time between shift-clicks
-    private static final long SPLIT_DELAY_MS = 50L;        // time between clicks while splitting into singles
-    private static final long COLLECT_RECHECK_MS = 400L;   // pause before re-sweeping a page for leftovers
-    private static final int COLLECT_MAX_SWEEPS = 3;       // re-sweeps before treating the inventory as full
-    private static final long MENU_SETTLE_MS = 300L;       // let a newly opened menu fill with items
-    private static final long PAGE_SETTLE_MS = 500L;       // let a new page load
-    private static final long MENU_TIMEOUT_MS = 5000L;     // give up if a menu never opens
+    // ---- Fixed timing (safe values) ---------------------------------------------------
+    private static final long SELECT_WAIT_MS = 150L;       // after changing hotbar slot, before the command
+    private static final long INV_OPEN_WAIT_MS = 500L;     // pauses around opening/closing the inventory
+    private static final long REFILL_STEP_MS = 150L;       // between inventory moves
+    private static final long REFILL_AFTER_MS = 500L;      // after closing the inventory
+    private static final long PAGE_SETTLE_MS = 800L;       // let a new collect page load
+    private static final long MENU_TIMEOUT_MS = 6000L;     // a menu must open within this
     private static final long FIRST_CHEST_EXTRA_DELAY_MS = 1000L; // extra wait once "my orders" opens (laggy step)
-    private static final long FIRST_CHEST_TIMEOUT_MS = 10000L;    // that step is allowed to take longer
+    private static final long FIRST_CHEST_TIMEOUT_MS = 12000L;    // that step may take longer
+    private static final long COLLECT_RECHECK_MS = 500L;   // before re-sweeping a page for leftovers
+    private static final int COLLECT_MAX_SWEEPS = 3;
+    private static final int EMPTY_PAGES_LIMIT = 3;        // pages in a row with no items => order empty
+    private static final int MAX_RECOVERIES = 3;           // automatic recoveries before giving up
+    private static final int MAX_FIX_ATTEMPTS = 24;        // single-item repair attempts per collect
+    private static final int ORDER_SLOT_RECHECKS = 3;      // times to re-check an "empty" order slot
+    // ---- Menu layout (slot numbers are 0-indexed) -------------------------------------
+    private static final int CHEST_ICON_SLOT = 51;         // /orders page: chest icon (my orders)
+    private static final int EDIT_CHEST_SLOT = 13;         // Edit Order page: chest in the middle
+    private static final int COLLECT_ITEM_SLOTS = 45;      // Collect Items: slots 0-44 hold items
+    private static final int COLLECT_NEXT_SLOT = 53;       // Collect Items: next-page arrow
+    // title that should be showing after N navigation clicks (empty = unknown, not checked)
+    private static final String[] NAV_TITLES = {"Orders", "Your Orders", "Edit Order", "Collect"};
     // -------------------------------------------------------------------------------------
 
     private enum State {
-        IDLE, PICK, SEND, PRESELECT, REFILL_OPEN, REFILL_MOVE, REFILL_CLOSE,
+        IDLE, SELECT, SEND, CHECK, AH_WAIT, REFILL_OPEN, REFILL_MOVE, REFILL_CLOSE,
         FLIP_COMMAND, FLIP_WAIT_MENU, FLIP_CLICK_NAV, FLIP_COLLECT, FLIP_CLOSE
     }
 
-    // saved settings
+    // ---- Saved settings ----------------------------------------------------------------
     public static String price = "";          // price for a whole stack
-    public static String singlePrice = "";    // price for a single item (Singles mode)
+    public static String singlePrice = "";    // price for a single item
     public static boolean singlesMode = false;
-    public static String delayText = String.valueOf(MIN_LIST_DELAY_MS);
-    private static int listingDelayMs = MIN_LIST_DELAY_MS;
+    public static int orderSlot = 1;          // 1-45, slot of the order on the "my orders" page
+    public static int listingDelayMs = 500;   // between /ah sell commands
+    public static int menuWaitMs = 600;       // wait after a menu opens
+    public static int clickDelayMs = 300;     // between shift-clicks while collecting
+    public static int splitDelayMs = 150;     // between clicks while splitting into singles
+    public static int ahRetrySec = 30;        // retry interval when the AH is full
+    public static int stuckSec = 60;          // no-progress timeout before auto-recovery
 
     private static KeyMapping openGuiKey;
     private static KeyMapping toggleKey;
@@ -86,11 +95,17 @@ public class DonutSellClient implements ClientModInitializer {
     private static boolean announced = false;
 
     // selling state
-    private static int sellIndex = 0;
-    private static int nextFrom = 0;
-    private static int pendingSlot = -1;
-    private static int pendingChecks = 0;
-    private static long lastSendAt = 0L;
+    private static int hotbarIndex = 0;
+    private static int attempts = 0;
+    private static boolean ahWaiting = false;
+    private static long retryAt = 0L;
+
+    // watchdog / stats
+    private static long lastProgressAt = 0L;
+    private static int recoveries = 0;
+    private static long startMs = 0L;
+    private static int listings = 0;
+    private static int cycles = 0;
 
     // order-flip state
     private static boolean flipMode = false;
@@ -98,12 +113,19 @@ public class DonutSellClient implements ClientModInitializer {
     private static int prevContainerId = 0;
     private static Screen prevScreen = null;
     private static long deadline = 0L;
+    private static int orderEmptyChecks = 0;
     private static boolean pageClicked = false;
     private static int emptyStreak = 0;
     private static int collectCursor = 0;
     private static int collectSweeps = 0;
+
+    // single-item splitting state
     private static int splitSource = -1;
-    private static final java.util.BitSet splitUsed = new java.util.BitSet(); // slots already given a single this cycle
+    private static int lastTarget = -1;
+    private static int targetRetry = 0;
+    private static boolean placing = false;
+    private static int fixAttempts = 0;
+    private static final BitSet splitUsed = new BitSet();   // slots already given a single this cycle
 
     @Override
     public void onInitializeClient() {
@@ -218,7 +240,6 @@ public class DonutSellClient implements ClientModInitializer {
         if (now - lastOpenAt < 600L) return; // same key press seen by two detectors
         lastOpenAt = now;
         if (mc.player == null || current instanceof SellScreen) return;
-        System.out.println("[DonutSell] open-GUI key (" + source + ")");
         setScreen(mc, new SellScreen());
     }
 
@@ -227,7 +248,6 @@ public class DonutSellClient implements ClientModInitializer {
         if (now - lastToggleAt < 600L) return;
         lastToggleAt = now;
         if (mc.player == null) return;
-        System.out.println("[DonutSell] start/stop key (" + source + ")");
         if (isRunning()) stop(mc, true);
         else start(mc);
     }
@@ -237,13 +257,12 @@ public class DonutSellClient implements ClientModInitializer {
         if (now - lastFlipAt < 600L) return;
         lastFlipAt = now;
         if (mc.player == null) return;
-        System.out.println("[DonutSell] order-flip key (" + source + ")");
         if (isRunning()) stop(mc, true);
         else startFlip(mc);
     }
 
     // ===================================================================================
-    //  Start / stop
+    //  Start / stop / failsafes
     // ===================================================================================
 
     public static boolean isRunning() {
@@ -263,59 +282,130 @@ public class DonutSellClient implements ClientModInitializer {
         if (player == null) return false;
         if (!isValidPrice(price) || (singlesMode && !isValidPrice(singlePrice))) {
             player.sendOverlayMessage(Component.literal(singlesMode
-                    ? "DonutSell: enter both the stack price and the single price"
-                    : "DonutSell: enter a price first"));
+                    ? "DonutSell: enter the Single price AND the Stack price (Singles + Stacks tabs)"
+                    : "DonutSell: enter a Stack price first (Stacks tab)").withStyle(ChatFormatting.RED));
             if (!(current instanceof SellScreen)) setScreen(mc, new SellScreen());
             return false;
         }
-        sellIndex = 0;
-        nextFrom = 0;
-        pendingSlot = -1;
-        pendingChecks = 0;
-        splitUsed.clear();
+        hotbarIndex = 0;
+        attempts = 0;
+        ahWaiting = false;
+        recoveries = 0;
+        listings = 0;
+        cycles = 0;
+        startMs = System.currentTimeMillis();
+        resetCollect();
         flipMode = flip;
-        nextAt = System.currentTimeMillis();
+        nextAt = startMs;
+        lastProgressAt = startMs;
         String what = singlesMode ? (singlePrice + " per single") : (price + " per stack");
         if (flip) {
             state = State.FLIP_COMMAND;
-            player.sendOverlayMessage(Component.literal("DonutSell: order flip ON (" + what + ")"));
+            player.sendOverlayMessage(Component.literal("DonutSell: order flip ON (" + what + ", slot " + orderSlot + ")")
+                    .withStyle(ChatFormatting.GREEN));
+            log("START order flip | " + what + " | order slot " + orderSlot);
         } else {
-            state = State.PICK;
-            player.sendOverlayMessage(Component.literal("DonutSell: ON (" + what + ")"));
+            state = State.SELECT;
+            player.sendOverlayMessage(Component.literal("DonutSell: ON (" + what + ")").withStyle(ChatFormatting.GREEN));
+            log("START selling | " + what);
         }
         return true;
     }
 
+    private static void resetCollect() {
+        pageClicked = false;
+        emptyStreak = 0;
+        collectCursor = 0;
+        collectSweeps = 0;
+        splitSource = -1;
+        lastTarget = -1;
+        targetRetry = 0;
+        placing = false;
+        fixAttempts = 0;
+        splitUsed.clear();
+        orderEmptyChecks = 0;
+    }
+
     public static void stop(Minecraft mc, boolean announce) {
-        boolean wasRunning = isRunning();
+        boolean was = isRunning();
+        endRun(mc, "stopped by you", announce);
+        if (was && announce && mc.player != null) {
+            mc.player.sendOverlayMessage(Component.literal("DonutSell: OFF").withStyle(ChatFormatting.GOLD));
+        }
+    }
+
+    private static void endRun(Minecraft mc, String reason, boolean chat) {
+        boolean was = isRunning();
         state = State.IDLE;
         flipMode = false;
-        if (wasRunning && announce && mc.player != null) {
-            mc.player.sendOverlayMessage(Component.literal("DonutSell: OFF"));
+        ahWaiting = false;
+        if (was) {
+            log("STOP: " + reason + " | " + summary());
+            if (chat && mc.player != null) {
+                mc.player.sendSystemMessage(Component.literal("DonutSell stopped (" + reason + "): " + summary())
+                        .withStyle(ChatFormatting.GOLD));
+            }
         }
     }
 
     private static void finish(Minecraft mc) {
-        state = State.IDLE;
-        flipMode = false;
+        endRun(mc, "nothing left to sell", true);
         if (mc.player != null) {
-            mc.player.sendOverlayMessage(Component.literal("DonutSell: finished, nothing left to sell"));
+            mc.player.sendOverlayMessage(Component.literal("DonutSell: finished, nothing left to sell")
+                    .withStyle(ChatFormatting.GREEN));
         }
     }
 
-    private static void failed(Minecraft mc) {
-        state = State.IDLE;
-        flipMode = false;
-        setScreen(mc, new ListingFailedScreen());
-    }
-
-    private static void flipStop(Minecraft mc, String line1, String line2) {
-        state = State.IDLE;
-        flipMode = false;
+    /** Hard stop with a popup you must close. */
+    private static void failStop(Minecraft mc, String line1, String line2) {
         if (mc.player != null && mc.player.containerMenu != mc.player.inventoryMenu) {
             mc.player.closeContainer();
         }
+        endRun(mc, line1, true);
         setScreen(mc, new ListingFailedScreen(line1, line2));
+    }
+
+    private static void touch() {
+        lastProgressAt = System.currentTimeMillis();
+    }
+
+    /** Real progress (a listing went through, an item was collected): also clears the recovery counter. */
+    private static void success() {
+        lastProgressAt = System.currentTimeMillis();
+        recoveries = 0;
+    }
+
+    /** Something went wrong: close everything and restart the current loop, a few times, then give up. */
+    private static void recover(Minecraft mc, String reason) {
+        recoveries++;
+        log("RECOVER " + recoveries + "/" + MAX_RECOVERIES + ": " + reason);
+        if (recoveries > MAX_RECOVERIES) {
+            failStop(mc, "Stopped after repeated problems.", reason);
+            return;
+        }
+        long now = System.currentTimeMillis();
+        LocalPlayer p = mc.player;
+        if (p != null) {
+            if (p.containerMenu != p.inventoryMenu) p.closeContainer();
+            p.sendOverlayMessage(Component.literal("DonutSell: problem, retrying (" + recoveries + "/" + MAX_RECOVERIES + ")")
+                    .withStyle(ChatFormatting.RED));
+        }
+        resetCollect();
+        lastProgressAt = now;
+        if (flipMode) {
+            state = State.FLIP_COMMAND;
+            nextAt = now + 1500L;
+        } else {
+            hotbarIndex = 0;
+            attempts = 0;
+            state = State.SELECT;
+            nextAt = now + 1000L;
+        }
+    }
+
+    private static String summary() {
+        long s = Math.max(0L, (System.currentTimeMillis() - startMs) / 1000L);
+        return listings + " listings, " + cycles + " cycles, " + (s / 3600) + "h " + ((s % 3600) / 60) + "m " + (s % 60) + "s";
     }
 
     private static boolean isValidPrice(String p) {
@@ -325,10 +415,6 @@ public class DonutSellClient implements ClientModInitializer {
         } catch (NumberFormatException e) {
             return false;
         }
-    }
-
-    private static long listingDelay() {
-        return Math.max(MIN_LIST_DELAY_MS, listingDelayMs);
     }
 
     private static String priceFor(int count) {
@@ -342,87 +428,114 @@ public class DonutSellClient implements ClientModInitializer {
     private static void tick(Minecraft mc) {
         LocalPlayer player = mc.player;
         if (player == null || mc.gameMode == null) {
-            state = State.IDLE; // left the world
+            if (state != State.IDLE) log("STOP: left the world | " + summary());
+            state = State.IDLE; // left the world / disconnected
+            flipMode = false;
+            ahWaiting = false;
             return;
         }
 
         if (!announced) {
             announced = true;
-            player.sendOverlayMessage(Component.literal("DonutSell loaded"));
+            player.sendOverlayMessage(Component.literal("DonutSell loaded").withStyle(ChatFormatting.GOLD));
         }
 
         handleKeys(mc);
         if (state == State.IDLE) return;
 
+        if (player.getHealth() <= 0.0f) {
+            endRun(mc, "you died", true);
+            return;
+        }
+
         long now = System.currentTimeMillis();
+
+        // Watchdog: nothing useful happened for too long -> reset and retry.
+        if (state != State.AH_WAIT && now - lastProgressAt > stuckSec * 1000L) {
+            recover(mc, "no progress for " + stuckSec + "s (in " + state + ")");
+            return;
+        }
+
         if (now < nextAt) return;
 
         switch (state) {
 
             // ---------------- selling ----------------
-            case PICK -> {
-                // 1) Did the previous listing really leave the hotbar?
-                if (pendingSlot >= 0) {
-                    if (hasItem(player, pendingSlot)) {
-                        pendingChecks++;
-                        if (pendingChecks == 1 || pendingChecks == 3) {   // give the server a moment
-                            nextAt = now + listingDelay();
-                            return;
-                        }
-                        if (pendingChecks == 2) {                         // try that slot once more
-                            sellIndex = pendingSlot;
-                            player.getInventory().setSelectedSlot(sellIndex);
-                            state = State.SEND;
-                            nextAt = now + SELECT_WAIT_MS;
-                            return;
-                        }
-                        failed(mc);                                       // still there: listings full
-                        return;
-                    }
-                    pendingSlot = -1;
-                    pendingChecks = 0;
-                }
-                // 2) Pick the next hotbar slot with an item.
-                int idx = nextHotbarWithItem(player, nextFrom);
+            case SELECT -> {
+                int idx = nextHotbarWithItem(player, hotbarIndex);
                 if (idx >= 0) {
-                    nextFrom = idx + 1;
-                    sellIndex = idx;
-                    if (player.getInventory().getSelectedSlot() != idx) {
-                        player.getInventory().setSelectedSlot(idx);
-                        nextAt = now + SELECT_WAIT_MS;
-                    }
+                    hotbarIndex = idx;
+                    attempts = 0;
+                    player.getInventory().setSelectedSlot(idx);
                     state = State.SEND;
+                    nextAt = now + SELECT_WAIT_MS;
                 } else if (firstMainWithItem(player) >= 0) {
                     state = State.REFILL_OPEN;
                     nextAt = now;
                 } else if (flipMode) {
-                    state = State.FLIP_COMMAND;                // everything sold: get more from the order
+                    cycles++;
+                    log("CYCLE " + cycles + " finished | " + summary());
+                    state = State.FLIP_COMMAND;                 // everything sold: get more from the order
                     nextAt = now + INV_OPEN_WAIT_MS;
                 } else {
                     finish(mc);
                 }
             }
             case SEND -> {
-                var stack = player.getInventory().getItem(sellIndex);
-                if (stack.isEmpty()) {                          // already gone (e.g. slow confirmation)
-                    pendingSlot = -1;
-                    pendingChecks = 0;
-                    state = State.PICK;
+                var stack = player.getInventory().getItem(hotbarIndex);
+                if (stack.isEmpty()) {                           // already gone
+                    hotbarIndex++;
+                    state = State.SELECT;
                     nextAt = now;
                     return;
                 }
                 player.connection.sendCommand("ah sell " + priceFor(stack.getCount()));
-                pendingSlot = sellIndex;
-                lastSendAt = now;
-                state = State.PRESELECT;
-                nextAt = now + PRESELECT_AFTER_MS;
+                state = State.CHECK;
+                nextAt = now + Math.max(0L, listingDelayMs - SELECT_WAIT_MS);
             }
-            case PRESELECT -> {
-                // Switch to the next slot a little after the command so the next one can follow right on time.
-                int nxt = nextHotbarWithItem(player, nextFrom);
-                if (nxt >= 0) player.getInventory().setSelectedSlot(nxt);
-                state = State.PICK;
-                nextAt = Math.max(now, lastSendAt + listingDelay());
+            case CHECK -> {
+                if (!hasItem(player, hotbarIndex)) {
+                    listings++;
+                    success();
+                    if (ahWaiting) {
+                        ahWaiting = false;
+                        log("AH has room again - resuming");
+                        player.sendSystemMessage(Component.literal("DonutSell: AH has room again - resuming.")
+                                .withStyle(ChatFormatting.GREEN));
+                    }
+                    hotbarIndex++;
+                    state = State.SELECT;
+                    nextAt = now;
+                } else if (attempts < 1) {
+                    attempts++;                                  // one retry in case the answer was slow
+                    state = State.SEND;
+                    nextAt = now;
+                } else {
+                    // Still in hand after two tries: the AH is full. Keep waiting and retrying.
+                    if (!ahWaiting) {
+                        ahWaiting = true;
+                        log("AH FULL - waiting, retry every " + ahRetrySec + "s");
+                        player.sendSystemMessage(Component.literal("DonutSell: your AH listings look full. "
+                                + "Waiting and retrying every " + ahRetrySec + "s until one sells.")
+                                .withStyle(ChatFormatting.RED));
+                    }
+                    retryAt = now + ahRetrySec * 1000L;
+                    state = State.AH_WAIT;
+                    nextAt = now;
+                }
+            }
+            case AH_WAIT -> {
+                touch();                                         // waiting for the AH is intentional, never "stuck"
+                if (now >= retryAt) {
+                    attempts = 0;
+                    state = State.SELECT;                        // same slot is still first with an item
+                    nextAt = now;
+                } else {
+                    long left = (retryAt - now + 999L) / 1000L;
+                    player.sendOverlayMessage(Component.literal("DonutSell: AH FULL - retrying in " + left + "s")
+                            .withStyle(ChatFormatting.RED, ChatFormatting.BOLD));
+                    nextAt = now + 1000L;
+                }
             }
 
             // ---------------- hotbar refill (inventory opens visibly) ----------------
@@ -446,10 +559,8 @@ public class DonutSellClient implements ClientModInitializer {
             }
             case REFILL_CLOSE -> {
                 player.closeContainer();
-                nextFrom = 0;
-                pendingSlot = -1;
-                pendingChecks = 0;
-                state = State.PICK;
+                hotbarIndex = 0;
+                state = State.SELECT;
                 nextAt = now + REFILL_AFTER_MS;
             }
 
@@ -458,48 +569,69 @@ public class DonutSellClient implements ClientModInitializer {
                 prevContainerId = player.containerMenu.containerId;
                 prevScreen = current;
                 navIndex = 0;
+                orderEmptyChecks = 0;
                 player.connection.sendCommand("orders");
                 state = State.FLIP_WAIT_MENU;
                 deadline = now + MENU_TIMEOUT_MS;
             }
             case FLIP_WAIT_MENU -> {
                 if (menuOpenedSince(player)) {
-                    if (navIndex >= NAV_SLOTS.length) {
-                        String title = screenTitle();
-                        if (!title.isEmpty() && !title.contains("Collect")) {
-                            flipStop(mc, "Expected the Collect Items menu but got:", title);
-                            return;
-                        }
-                        pageClicked = false;
-                        emptyStreak = 0;
-                        collectCursor = 0;
-                        collectSweeps = 0;
-                        splitSource = -1;
-                        splitUsed.clear();
+                    touch();
+                    String title = (current != prevScreen) ? screenTitle().toLowerCase() : "";
+                    String expect = NAV_TITLES[Math.min(navIndex, NAV_TITLES.length - 1)].toLowerCase();
+                    if (!expect.isEmpty() && !title.isEmpty() && !title.contains(expect)) {
+                        recover(mc, "unexpected menu '" + screenTitle() + "' (wanted '" + expect + "')");
+                        return;
+                    }
+                    if (navIndex >= NAV_TITLES.length - 1) {     // arrived at Collect Items
+                        resetCollect();
                         state = State.FLIP_COLLECT;
                     } else {
                         state = State.FLIP_CLICK_NAV;
                     }
-                    nextAt = now + MENU_SETTLE_MS;
+                    nextAt = now + menuWaitMs;
                     if (navIndex == 1) nextAt += FIRST_CHEST_EXTRA_DELAY_MS; // "my orders" page just opened
                 } else if (now > deadline) {
-                    flipStop(mc, "A menu did not open (step " + navIndex + " of " + NAV_SLOTS.length + ").",
-                            "Open title: " + screenTitle());
+                    recover(mc, "menu did not open (step " + navIndex + ")");
                 }
             }
             case FLIP_CLICK_NAV -> {
-                prevContainerId = player.containerMenu.containerId;
+                var menu = player.containerMenu;
+                if (menu == player.inventoryMenu) {
+                    recover(mc, "menu closed before the next click");
+                    return;
+                }
+                int slot;
+                if (navIndex == 0) {
+                    slot = CHEST_ICON_SLOT;
+                } else if (navIndex == 1) {
+                    slot = orderSlot - 1;
+                    if (slot >= menu.slots.size() || isPlaceholder(menu.getSlot(slot).getItem())) {
+                        orderEmptyChecks++;                       // may just still be loading: look again
+                        if (orderEmptyChecks <= ORDER_SLOT_RECHECKS) {
+                            nextAt = now + 1000L;
+                            return;
+                        }
+                        failStop(mc, "Order slot " + orderSlot + " is empty.",
+                                "Pick a different slot on the Flip tab, then start again.");
+                        return;
+                    }
+                    orderEmptyChecks = 0;
+                } else {
+                    slot = EDIT_CHEST_SLOT;
+                }
+                prevContainerId = menu.containerId;
                 prevScreen = current;
-                mc.gameMode.handleContainerInput(player.containerMenu.containerId,
-                        NAV_SLOTS[navIndex], 0, ContainerInput.PICKUP, player);
+                mc.gameMode.handleContainerInput(menu.containerId, slot, 0, ContainerInput.PICKUP, player);
                 navIndex++;
                 state = State.FLIP_WAIT_MENU;
                 deadline = now + (navIndex == 1 ? FIRST_CHEST_TIMEOUT_MS : MENU_TIMEOUT_MS);
+                touch();
             }
             case FLIP_COLLECT -> {
                 var menu = player.containerMenu;
                 if (menu == player.inventoryMenu || menu.slots.size() < 54) {
-                    flipStop(mc, "The Collect Items menu closed unexpectedly.", "Order flip stopped.");
+                    recover(mc, "collect menu closed unexpectedly");
                     return;
                 }
                 if (singlesMode) collectSingles(mc, player, menu, now);
@@ -507,11 +639,11 @@ public class DonutSellClient implements ClientModInitializer {
             }
             case FLIP_CLOSE -> {
                 player.closeContainer();
-                nextFrom = 0;
-                pendingSlot = -1;
-                pendingChecks = 0;
-                state = State.PICK;                          // hand over to the selling loop
-                nextAt = now + MENU_SETTLE_MS;
+                hotbarIndex = 0;
+                attempts = 0;
+                touch();
+                state = State.SELECT;                             // hand over to the selling loop
+                nextAt = now + menuWaitMs;
             }
             default -> { }
         }
@@ -522,8 +654,8 @@ public class DonutSellClient implements ClientModInitializer {
     /** Stacks mode: shift-click every filled slot once, left to right. */
     private static void collectStacks(Minecraft mc, LocalPlayer player, AbstractContainerMenu menu, long now) {
         if (firstEmptyInventorySlot(player) < 0) {
-            state = State.FLIP_CLOSE;                       // inventory full: go sell
-            nextAt = now + 200L;
+            state = State.FLIP_CLOSE;                           // inventory full: go sell
+            nextAt = now + 300L;
             return;
         }
         int slot = nextMenuItem(menu, collectCursor);
@@ -531,34 +663,83 @@ public class DonutSellClient implements ClientModInitializer {
             mc.gameMode.handleContainerInput(menu.containerId, slot, 0, ContainerInput.QUICK_MOVE, player);
             pageClicked = true;
             collectCursor = slot + 1;
-            nextAt = now + COLLECT_DELAY_MS;
+            nextAt = now + clickDelayMs;
+            success();
         } else {
             endOfPage(mc, player, menu, now);
         }
     }
 
-    /** Singles mode: pick a stack up, then right-click empty inventory slots to drop one item in each. */
+    /**
+     * Singles mode, built for reliability: pick a stack up, drop ONE item per free slot (never the same
+     * slot twice), confirm each drop, then repair any slot that still ended up with 2+ items.
+     */
     private static void collectSingles(Minecraft mc, LocalPlayer player, AbstractContainerMenu menu, long now) {
         var held = menu.getCarried();
+
+        // 0) Did the item we just placed really land?
+        if (lastTarget >= 0) {
+            int t = lastTarget;
+            lastTarget = -1;
+            var placed = menu.getSlot(t).getItem();
+            if (placed.isEmpty() && !held.isEmpty() && targetRetry < 1) {
+                targetRetry++;                                    // looks like it did not land: try that slot again
+                lastTarget = t;
+                mc.gameMode.handleContainerInput(menu.containerId, t, 1, ContainerInput.PICKUP, player);
+                nextAt = now + splitDelayMs;
+                return;
+            }
+            targetRetry = 0;
+            if (!placed.isEmpty()) success();
+        }
+
+        // 1) Cursor holds a stack: drop one item into the next free slot.
         if (!held.isEmpty()) {
+            placing = true;
             int target = nextSplitTarget(menu);
             if (target >= 0) {
-                splitUsed.set(target);   // never give the same slot a second item, even if the server is slow to confirm
+                splitUsed.set(target);
+                lastTarget = target;
                 mc.gameMode.handleContainerInput(menu.containerId, target, 1, ContainerInput.PICKUP, player);
-                nextAt = now + SPLIT_DELAY_MS;
+                nextAt = now + splitDelayMs;
+                touch();
             } else {
-                // No room left for the rest: put it back where it came from and go sell.
+                // No room left: put the rest back where it came from and go sell.
                 if (splitSource >= 0) {
                     mc.gameMode.handleContainerInput(menu.containerId, splitSource, 0, ContainerInput.PICKUP, player);
                 }
+                placing = false;
                 state = State.FLIP_CLOSE;
-                nextAt = now + 200L;
+                nextAt = now + menuWaitMs;
             }
             return;
         }
+
+        // The stack was just finished: give the server a moment to settle before checking the result.
+        if (placing) {
+            placing = false;
+            nextAt = now + splitDelayMs * 2L;
+            return;
+        }
+
+        // 2) Cursor empty: repair any slot that ended up with 2+ items.
+        if (fixAttempts < MAX_FIX_ATTEMPTS) {
+            int bad = firstMultiUsedSlot(menu);
+            if (bad >= 0 && nextSplitTarget(menu) >= 0) {
+                fixAttempts++;
+                log("FIX: slot " + bad + " held " + menu.getSlot(bad).getItem().getCount() + " items, re-splitting");
+                splitUsed.clear(bad);
+                splitSource = bad;
+                mc.gameMode.handleContainerInput(menu.containerId, bad, 0, ContainerInput.PICKUP, player);
+                nextAt = now + splitDelayMs;
+                return;
+            }
+        }
+
+        // 3) Normal progress: pick the next stack from the page.
         if (nextSplitTarget(menu) < 0) {
-            state = State.FLIP_CLOSE;
-            nextAt = now + 200L;
+            state = State.FLIP_CLOSE;                             // inventory full: go sell
+            nextAt = now + menuWaitMs;
             return;
         }
         int slot = nextMenuItem(menu, collectCursor);
@@ -567,7 +748,8 @@ public class DonutSellClient implements ClientModInitializer {
             collectCursor = slot + 1;
             pageClicked = true;
             mc.gameMode.handleContainerInput(menu.containerId, slot, 0, ContainerInput.PICKUP, player);
-            nextAt = now + SPLIT_DELAY_MS;
+            nextAt = now + splitDelayMs;
+            touch();
         } else {
             endOfPage(mc, player, menu, now);
         }
@@ -578,18 +760,18 @@ public class DonutSellClient implements ClientModInitializer {
         if (firstMenuItem(menu) >= 0) {
             // Something is still there.
             if (collectSweeps < COLLECT_MAX_SWEEPS) {
-                collectSweeps++;                            // server may just be slow: sweep again
+                collectSweeps++;                                // server may just be slow: sweep again
                 collectCursor = 0;
                 nextAt = now + COLLECT_RECHECK_MS;
             } else {
-                state = State.FLIP_CLOSE;                   // items won't move: inventory is full, go sell
-                nextAt = now + 200L;
+                state = State.FLIP_CLOSE;                       // items won't move: inventory is full, go sell
+                nextAt = now + 300L;
             }
             return;
         }
         if (pageClicked) emptyStreak = 0; else emptyStreak++;
         if (emptyStreak >= EMPTY_PAGES_LIMIT) {
-            flipStop(mc, "This order looks empty (" + EMPTY_PAGES_LIMIT + " pages in a row had no items).",
+            failStop(mc, "This order looks empty (" + EMPTY_PAGES_LIMIT + " pages in a row had no items).",
                     "Anything already collected is still in your inventory - press J to sell it.");
             return;
         }
@@ -598,6 +780,7 @@ public class DonutSellClient implements ClientModInitializer {
         collectCursor = 0;
         collectSweeps = 0;
         nextAt = now + PAGE_SETTLE_MS;
+        touch();
     }
 
     // ---- helpers -----------------------------------------------------------------------
@@ -613,6 +796,17 @@ public class DonutSellClient implements ClientModInitializer {
             return cs.getTitle().getString();
         }
         return "";
+    }
+
+    /** Empty or locked order slots are drawn as gray/red glass panes, so a pane counts as "no order here". */
+    private static boolean isPlaceholder(net.minecraft.world.item.ItemStack stack) {
+        if (stack.isEmpty()) return true;
+        try {
+            String path = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(stack.getItem()).getPath();
+            return path.contains("glass_pane");
+        } catch (RuntimeException e) {
+            return false;
+        }
     }
 
     private static boolean hasItem(LocalPlayer p, int slot) {
@@ -658,6 +852,14 @@ public class DonutSellClient implements ClientModInitializer {
         return -1;
     }
 
+    /** A slot we gave a single to that now holds 2 or more items. */
+    private static int firstMultiUsedSlot(AbstractContainerMenu menu) {
+        for (int i = menu.slots.size() - 36; i < menu.slots.size(); i++) {
+            if (splitUsed.get(i) && menu.getSlot(i).getItem().getCount() > 1) return i;
+        }
+        return -1;
+    }
+
     // ===================================================================================
     //  Screens (setScreen moved around in 26.x, so find it at runtime)
     // ===================================================================================
@@ -680,7 +882,7 @@ public class DonutSellClient implements ClientModInitializer {
         }
         if (gui != null && invokeSetScreen(gui, screen)) return;
         if (invokeSetScreen(mc, screen)) return;
-        System.out.println("[DonutSell] ERROR: could not find a setScreen method");
+        log("ERROR: could not find a setScreen method");
         if (screen != null && mc.player != null) {
             mc.player.sendOverlayMessage(Component.literal("DonutSell: could not open screen (see log)"));
         }
@@ -697,7 +899,7 @@ public class DonutSellClient implements ClientModInitializer {
                         m.invoke(target, screen);
                         return true;
                     } catch (ReflectiveOperationException | RuntimeException e) {
-                        System.out.println("[DonutSell] setScreen failed: " + e + " / " + e.getCause());
+                        log("setScreen failed: " + e + " / " + e.getCause());
                     }
                 }
             }
@@ -706,11 +908,23 @@ public class DonutSellClient implements ClientModInitializer {
     }
 
     // ===================================================================================
-    //  Saved settings
+    //  Log file + saved settings
     // ===================================================================================
 
     private static Path configPath() {
         return FabricLoader.getInstance().getConfigDir().resolve("donutsell.properties");
+    }
+
+    /** Events are written to config/donutsell.log (and the game log) so problems can be diagnosed later. */
+    private static void log(String msg) {
+        System.out.println("[DonutSell] " + msg);
+        try {
+            Path p = FabricLoader.getInstance().getConfigDir().resolve("donutsell.log");
+            if (Files.exists(p) && Files.size(p) > 1_000_000L) Files.delete(p);
+            Files.writeString(p, java.time.LocalTime.now().withNano(0) + "  " + msg + System.lineSeparator(),
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (IOException | RuntimeException ignored) {
+        }
     }
 
     public static void setPrice(String value) {
@@ -728,14 +942,38 @@ public class DonutSellClient implements ClientModInitializer {
         saveConfig();
     }
 
-    public static void setDelay(String digits) {
-        delayText = digits;
+    private static int clamp(int v, int min, int max, int def) {
+        if (v < 0) return def;
+        return Math.max(min, Math.min(max, v));
+    }
+
+    /** Numeric settings from the GUI. Empty box = default, values are kept inside safe limits. */
+    public static void setSetting(String name, String digits) {
+        int v;
         try {
-            listingDelayMs = digits.isEmpty() ? MIN_LIST_DELAY_MS : (int) Math.min(Long.parseLong(digits), 60000L);
+            v = digits.isEmpty() ? -1 : (int) Math.min(Long.parseLong(digits), 1_000_000L);
         } catch (NumberFormatException e) {
-            listingDelayMs = MIN_LIST_DELAY_MS;
+            v = -1;
+        }
+        switch (name) {
+            case "orderSlot" -> orderSlot = clamp(v, 1, 45, 1);
+            case "listingDelay" -> listingDelayMs = clamp(v, 250, 10000, 500);
+            case "menuWait" -> menuWaitMs = clamp(v, 200, 10000, 600);
+            case "clickDelay" -> clickDelayMs = clamp(v, 100, 5000, 300);
+            case "splitDelay" -> splitDelayMs = clamp(v, 50, 5000, 150);
+            case "ahRetry" -> ahRetrySec = clamp(v, 5, 3600, 30);
+            case "stuck" -> stuckSec = clamp(v, 20, 3600, 60);
+            default -> { }
         }
         saveConfig();
+    }
+
+    private static int intProp(Properties props, String key, int def) {
+        try {
+            return Integer.parseInt(props.getProperty(key, String.valueOf(def)));
+        } catch (NumberFormatException e) {
+            return def;
+        }
     }
 
     private static void loadConfig() {
@@ -747,12 +985,13 @@ public class DonutSellClient implements ClientModInitializer {
             price = props.getProperty("price", "");
             singlePrice = props.getProperty("singlePrice", "");
             singlesMode = Boolean.parseBoolean(props.getProperty("singlesMode", "false"));
-            delayText = props.getProperty("delay", String.valueOf(MIN_LIST_DELAY_MS));
-            try {
-                listingDelayMs = Integer.parseInt(delayText);
-            } catch (NumberFormatException e) {
-                listingDelayMs = MIN_LIST_DELAY_MS;
-            }
+            orderSlot = Math.max(1, Math.min(45, intProp(props, "orderSlot", 1)));
+            listingDelayMs = Math.max(250, intProp(props, "listingDelay", 500));
+            menuWaitMs = Math.max(200, intProp(props, "menuWait", 600));
+            clickDelayMs = Math.max(100, intProp(props, "clickDelay", 300));
+            splitDelayMs = Math.max(50, intProp(props, "splitDelay", 150));
+            ahRetrySec = Math.max(5, intProp(props, "ahRetry", 30));
+            stuckSec = Math.max(20, intProp(props, "stuck", 60));
         } catch (IOException ignored) {
         }
     }
@@ -763,7 +1002,13 @@ public class DonutSellClient implements ClientModInitializer {
             props.setProperty("price", price);
             props.setProperty("singlePrice", singlePrice);
             props.setProperty("singlesMode", String.valueOf(singlesMode));
-            props.setProperty("delay", delayText);
+            props.setProperty("orderSlot", String.valueOf(orderSlot));
+            props.setProperty("listingDelay", String.valueOf(listingDelayMs));
+            props.setProperty("menuWait", String.valueOf(menuWaitMs));
+            props.setProperty("clickDelay", String.valueOf(clickDelayMs));
+            props.setProperty("splitDelay", String.valueOf(splitDelayMs));
+            props.setProperty("ahRetry", String.valueOf(ahRetrySec));
+            props.setProperty("stuck", String.valueOf(stuckSec));
             props.store(out, "DonutSell");
         } catch (IOException ignored) {
         }
